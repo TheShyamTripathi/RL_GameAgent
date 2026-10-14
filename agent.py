@@ -21,6 +21,35 @@ from networks import QNetwork
 from replay_buffer import PrioritizedReplayBuffer, ReplayBuffer
 
 
+# ----------------------------------------------------------------------------
+# Checkpoint safety helpers
+# ----------------------------------------------------------------------------
+def _to_builtin(obj):
+    """Recursively convert NumPy scalars/arrays to plain Python types.
+    Keeps checkpoints loadable with torch.load(weights_only=True)."""
+    if isinstance(obj, dict):
+        return {str(k): _to_builtin(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_builtin(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+def _allow_numpy_globals() -> None:
+    """Allowlist the NumPy classes that old checkpoints may still contain."""
+    try:
+        from numpy._core.multiarray import scalar as np_scalar   # NumPy 2.x
+    except ImportError:
+        from numpy.core.multiarray import scalar as np_scalar    # NumPy 1.x
+    torch.serialization.add_safe_globals([np_scalar])
+
+
+_allow_numpy_globals()
+
+
 class DQNAgent:
     def __init__(self, state_dim: int, n_actions: int, cfg: TrainConfig, for_inference: bool = False):
         self.state_dim, self.n_actions, self.cfg = state_dim, n_actions, cfg
@@ -102,11 +131,14 @@ class DQNAgent:
 
     # ------------------------------------------------------------ persistence
     def save(self, path: str, extra: dict | None = None) -> None:
-        torch.save(
-            {"state_dict": self.policy_net.state_dict(), "state_dim": self.state_dim,
-             "n_actions": self.n_actions, "cfg": self.cfg.to_dict(), "extra": extra or {}},
-            path,
-        )
+        checkpoint = _to_builtin({
+            "state_dict": self.policy_net.state_dict(),   # tensors are left untouched
+            "state_dim": int(self.state_dim),
+            "n_actions": int(self.n_actions),
+            "cfg": self.cfg.to_dict(),
+            "extra": extra or {},
+        })
+        torch.save(checkpoint, path)
 
     @classmethod
     def load(cls, path: str) -> "DQNAgent":
