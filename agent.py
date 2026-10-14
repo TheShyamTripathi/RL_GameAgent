@@ -11,6 +11,8 @@ DQN agent with switchable extensions (all driven by `TrainConfig`):
 """
 from __future__ import annotations
 
+import pickle
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -26,7 +28,8 @@ from replay_buffer import PrioritizedReplayBuffer, ReplayBuffer
 # ----------------------------------------------------------------------------
 def _to_builtin(obj):
     """Recursively convert NumPy scalars/arrays to plain Python types.
-    Keeps checkpoints loadable with torch.load(weights_only=True)."""
+    Keeps checkpoints loadable with torch.load(weights_only=True).
+    Tensors (the state_dict values) are returned untouched."""
     if isinstance(obj, dict):
         return {str(k): _to_builtin(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -39,25 +42,58 @@ def _to_builtin(obj):
 
 
 def _allow_numpy_globals() -> None:
-    """Allowlist the NumPy classes that old checkpoints may still contain."""
+    """Best-effort allowlist of the NumPy helpers that OLD checkpoints may contain.
+
+    NumPy 1.x pickles them as `numpy.core.multiarray.scalar`, NumPy 2.x as
+    `numpy._core.multiarray.scalar`. The registered name must match the name stored
+    in the file, so we try to register every spelling that exists in this environment.
+    """
+    import importlib
+
+    safe = []
+    for module_name in ("numpy._core.multiarray", "numpy.core.multiarray"):
+        try:
+            safe.append(getattr(importlib.import_module(module_name), "scalar"))
+        except Exception:
+            continue
+    safe.append(np.dtype)
     try:
-        from numpy._core.multiarray import scalar as np_scalar   # NumPy 2.x
-    except ImportError:
-        from numpy.core.multiarray import scalar as np_scalar    # NumPy 1.x
-    torch.serialization.add_safe_globals([np_scalar])
+        torch.serialization.add_safe_globals(safe)
+    except Exception:
+        pass
 
 
 _allow_numpy_globals()
 
 
+def _load_checkpoint(path: str) -> dict:
+    """Load a checkpoint written by `DQNAgent.save`.
+
+    1. Try the safe path (weights_only=True) - works for every checkpoint saved by this code.
+    2. Legacy checkpoints (saved while NumPy scalars were still inside `extra`/`cfg`) cannot be
+       unpickled in safe mode. These are YOUR OWN local files, so we fall back to a full load,
+       sanitise the content and re-save the file once, so the next load is safe again.
+    """
+    device = configs.get_device()
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except pickle.UnpicklingError:
+        ckpt = _to_builtin(torch.load(path, map_location=device, weights_only=False))
+        try:
+            torch.save(ckpt, path)          # migrate to the clean format
+        except OSError:
+            pass
+        return ckpt
+
+
 class DQNAgent:
     def __init__(self, state_dim: int, n_actions: int, cfg: TrainConfig, for_inference: bool = False):
-        self.state_dim, self.n_actions, self.cfg = state_dim, n_actions, cfg
+        self.state_dim, self.n_actions, self.cfg = int(state_dim), int(n_actions), cfg
         self.device = configs.get_device()
 
         hidden = tuple(cfg.hidden)
-        self.policy_net = QNetwork(state_dim, n_actions, hidden, cfg.dueling).to(self.device)
-        self.target_net = QNetwork(state_dim, n_actions, hidden, cfg.dueling).to(self.device)
+        self.policy_net = QNetwork(self.state_dim, self.n_actions, hidden, cfg.dueling).to(self.device)
+        self.target_net = QNetwork(self.state_dim, self.n_actions, hidden, cfg.dueling).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
@@ -69,7 +105,8 @@ class DQNAgent:
 
         if not for_inference:
             self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=cfg.lr)
-            common = dict(capacity=cfg.buffer_size, state_dim=state_dim, n_step=cfg.n_step, gamma=cfg.gamma)
+            common = dict(capacity=cfg.buffer_size, state_dim=self.state_dim,
+                          n_step=cfg.n_step, gamma=cfg.gamma)
             self.buffer = (PrioritizedReplayBuffer(alpha=cfg.per_alpha, **common)
                            if cfg.prioritized else ReplayBuffer(**common))
 
@@ -142,7 +179,7 @@ class DQNAgent:
 
     @classmethod
     def load(cls, path: str) -> "DQNAgent":
-        ckpt = torch.load(path, map_location=configs.get_device(), weights_only=True)
+        ckpt = _load_checkpoint(path)
         cfg = TrainConfig.from_dict(ckpt["cfg"])
         agent = cls(ckpt["state_dim"], ckpt["n_actions"], cfg, for_inference=True)
         agent.policy_net.load_state_dict(ckpt["state_dict"])
